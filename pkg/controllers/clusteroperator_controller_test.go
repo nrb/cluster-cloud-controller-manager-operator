@@ -604,6 +604,38 @@ var _ = Describe("Apply resources should", func() {
 		Expect(dep.Labels[common.CloudControllerManagerProviderLabel]).To(Equal("AWS"))
 	})
 
+	It("should set Progressing=True on first sync and not signal progressing when resources are stable", func() {
+		co := &configv1.ClusterOperator{}
+		co.SetName(clusterOperatorName)
+		Expect(cl.Create(context.TODO(), co)).To(Succeed())
+
+		operatorConfig := getConfigForPlatform(&configv1.PlatformStatus{Type: configv1.AWSPlatformType})
+		awsResources, err := cloud.GetResources(operatorConfig)
+		Expect(err).To(Succeed())
+		resources = append(resources, awsResources...) // AfterEach handles cleanup
+
+		// First sync: resources do not yet exist, so applyResources reports updated=true.
+		progressing, err := reconciler.sync(context.TODO(), operatorConfig, nil)
+		Expect(err).To(Succeed())
+		Expect(progressing).To(BeTrue(), "sync should report progressing when resources are newly applied")
+
+		Expect(cl.Get(context.TODO(), client.ObjectKey{Name: clusterOperatorName}, co)).To(Succeed())
+		Expect(v1helpers.FindStatusCondition(co.Status.Conditions, configv1.OperatorProgressing).Status).To(
+			Equal(configv1.ConditionTrue), "Progressing should be True after resources are first applied",
+		)
+
+		// Second sync: resources exist and are unchanged, so applyResources reports updated=false.
+		progressing, err = reconciler.sync(context.TODO(), operatorConfig, nil)
+		Expect(err).To(Succeed())
+		Expect(progressing).To(BeFalse(), "sync should not report progressing when resources are already up to date")
+
+		// Progressing remains True because sync() does not clear it; only setStatusAvailable() does.
+		Expect(cl.Get(context.TODO(), client.ObjectKey{Name: clusterOperatorName}, co)).To(Succeed())
+		Expect(v1helpers.FindStatusCondition(co.Status.Conditions, configv1.OperatorProgressing).Status).To(
+			Equal(configv1.ConditionTrue), "Progressing should remain True until setStatusAvailable is called",
+		)
+	})
+
 	AfterEach(func() {
 		co := &configv1.ClusterOperator{}
 		err := cl.Get(context.Background(), client.ObjectKey{Name: clusterOperatorName}, co)

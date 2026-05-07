@@ -136,9 +136,15 @@ func (r *CloudOperatorReconciler) Reconcile(ctx context.Context, _ ctrl.Request)
 		return ctrl.Result{}, reconcile.TerminalError(fmt.Errorf("failed to build operator config: %w", err))
 	}
 
-	if err := r.sync(ctx, operatorConfig, conditionOverrides); err != nil {
+	progressing, err := r.sync(ctx, operatorConfig, conditionOverrides)
+	if err != nil {
 		klog.Errorf("Unable to sync operands: %s", err)
 		return ctrl.Result{}, fmt.Errorf("failed to sync operands: %w", err)
+	}
+	if progressing {
+		// Resources were applied but not yet converged. Progressing=True is already
+		// set; skip Available so the condition persists until the next reconcile.
+		return ctrl.Result{}, nil // defer clears failure window
 	}
 
 	if err := r.setStatusAvailable(ctx, conditionOverrides); err != nil {
@@ -191,33 +197,37 @@ func (r *CloudOperatorReconciler) handleDegradeError(ctx context.Context, condit
 	return ctrl.Result{}, nil // do not requeue; a watch event will re-trigger
 }
 
-func (r *CloudOperatorReconciler) sync(ctx context.Context, config config.OperatorConfig, conditionOverrides []configv1.ClusterOperatorStatusCondition) error {
-	// Deploy resources for platform
+// sync deploys resources for the platform. It returns (true, nil) when resources were
+// applied but the operator has not yet finished converging, signalling the caller to
+// leave Progressing=True and skip the Available transition for this reconcile cycle.
+func (r *CloudOperatorReconciler) sync(ctx context.Context, config config.OperatorConfig, conditionOverrides []configv1.ClusterOperatorStatusCondition) (bool, error) {
 	resources, err := cloud.GetResources(config)
 	if err != nil {
-		return err
+		return false, err
 	}
 	updated, err := r.applyResources(ctx, resources)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if updated {
-		return r.setStatusProgressing(ctx, conditionOverrides)
+		if err := r.setStatusProgressing(ctx, conditionOverrides); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-
-	return nil
+	return false, nil
 }
 
 // applyResources will apply all resources as-is to the cluster, allowing adding of custom annotations and lables
 func (r *CloudOperatorReconciler) applyResources(ctx context.Context, resources []client.Object) (bool, error) {
-	updated := false
-	var err error
+	anyUpdated := false
 
 	for _, resource := range resources {
-		updated, err = resourceapply.ApplyResource(ctx, r.Client, r.Recorder, resource)
+		updated, err := resourceapply.ApplyResource(ctx, r.Client, r.Recorder, resource)
 		if err != nil {
 			return false, err
 		}
+		anyUpdated = anyUpdated || updated
 
 		if err := r.watcher.Watch(ctx, resource); err != nil {
 			klog.Errorf("Unable to establish watch on object %s '%s': %+v", resource.GetObjectKind().GroupVersionKind(), resource.GetName(), err)
@@ -230,7 +240,7 @@ func (r *CloudOperatorReconciler) applyResources(ctx context.Context, resources 
 		klog.V(2).Info("Resources applied successfully.")
 	}
 
-	return updated, nil
+	return anyUpdated, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
